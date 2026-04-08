@@ -424,13 +424,21 @@ where
             entries: logs,
         };
 
-        // Use heartbeat_interval for empty heartbeats, replication_lag_timeout
-        // for data AppendEntries (which may require disk I/O on the follower).
+        // Heartbeat RPC timeout uses 2x heartbeat_interval to absorb runtime
+        // scheduling jitter between timer creation and first poll of the inner
+        // future. Data AppendEntries uses replication_lag_timeout (or 2x
+        // heartbeat if not configured) for follower disk I/O.
         let is_heartbeat = payload.entries.is_empty();
-        let timeout_ms = if is_heartbeat || self.config.replication_lag_timeout == 0 {
-            self.config.heartbeat_interval
-        } else {
+        let timeout_ms = if is_heartbeat {
+            // 2x gives scheduling headroom: the timer starts before the inner
+            // future is polled, consuming budget. The follower's election
+            // timeout (typically 10x heartbeat) provides the real failure
+            // detection window.
+            self.config.heartbeat_interval * 2
+        } else if self.config.replication_lag_timeout > 0 {
             self.config.replication_lag_timeout
+        } else {
+            self.config.heartbeat_interval * 2
         };
         let the_timeout = Duration::from_millis(timeout_ms);
 
