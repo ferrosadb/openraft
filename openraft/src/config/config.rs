@@ -128,6 +128,17 @@ pub struct Config {
     #[clap(long, default_value = "50")]
     pub heartbeat_interval: u64,
 
+    /// Timeout in milliseconds for AppendEntries RPCs that carry log entries
+    /// (data replication). When 0, defaults to `heartbeat_interval`.
+    ///
+    /// Separating this from `heartbeat_interval` allows fast failure detection
+    /// (short heartbeat) while giving data replication RPCs more time to
+    /// complete (e.g., when the follower's log store does disk I/O).
+    ///
+    /// Empty heartbeat AppendEntries (no entries) always use `heartbeat_interval`.
+    #[clap(long, default_value = "0")]
+    pub replication_lag_timeout: u64,
+
     /// The timeout for sending then installing the last snapshot segment,
     /// in millisecond. It is also used as the timeout for sending a non-last segment, if
     /// `send_snapshot_timeout` is 0.
