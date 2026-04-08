@@ -424,15 +424,25 @@ where
             entries: logs,
         };
 
+        // Use heartbeat_interval for empty heartbeats, replication_lag_timeout
+        // for data AppendEntries (which may require disk I/O on the follower).
+        let is_heartbeat = payload.entries.is_empty();
+        let timeout_ms = if is_heartbeat || self.config.replication_lag_timeout == 0 {
+            self.config.heartbeat_interval
+        } else {
+            self.config.replication_lag_timeout
+        };
+        let the_timeout = Duration::from_millis(timeout_ms);
+
         // Send the payload.
         tracing::debug!(
             payload=%payload.summary(),
             now = debug(leader_time),
-            "start sending append_entries, timeout: {:?}",
-            self.config.heartbeat_interval
+            timeout_ms,
+            is_heartbeat,
+            "start sending append_entries"
         );
 
-        let the_timeout = Duration::from_millis(self.config.heartbeat_interval);
         let option = RPCOption::new(the_timeout);
         let res = C::timeout(the_timeout, self.network.append_entries(payload, option)).await;
 
