@@ -674,6 +674,55 @@ pub(crate) enum RejectVoteRequest<NID: NodeId> {
     ByLastLogId(Option<LogId<NID>>),
 }
 
+/// Errors returned by `Trigger::transfer_to` (ferrosa fork — ADR-012, W3.9, W3.10).
+///
+/// Leadership transfer (Ongaro Sec 3.10) is a controlled, time-bounded operation: the
+/// leader catches the target up, sends a TimeoutNow directive, and watches for the
+/// target to win an election. Any of these steps can fail, so we surface a typed
+/// error per failure mode.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize), serde(bound = ""))]
+pub enum TransferError<NID: NodeId> {
+    /// The local node is not the current leader; transfer can only be initiated by a leader.
+    #[error("transfer_to refused: local node is not leader")]
+    NotLeader,
+
+    /// The transfer target is the local node itself.
+    #[error("transfer_to refused: target is self ({0})")]
+    TargetIsSelf(NID),
+
+    /// The target is not a voting member of the current effective membership.
+    #[error("transfer_to refused: target {0} is not a voter in the current membership")]
+    TargetNotVoter(NID),
+
+    /// The target's replication state could not catch up to the leader's last log id
+    /// after the configured number of retries.
+    #[error("transfer_to refused: target {target} is too far behind (matched={matched:?}, leader_last={leader_last:?})")]
+    TargetTooFarBehind {
+        target: NID,
+        matched: Option<LogId<NID>>,
+        leader_last: Option<LogId<NID>>,
+    },
+
+    /// The target rejected the TimeoutNow directive (e.g., it observed a higher term
+    /// or its log was behind by the time the RPC arrived).
+    #[error("transfer_to failed: target {0} refused TimeoutNow directive")]
+    TargetRefused(NID),
+
+    /// The transfer did not complete within the deadline (`election_timeout_max × 2`).
+    /// The target did not win an election in the allotted window.
+    #[error("transfer_to failed: timed out waiting for target to win election")]
+    Timeout,
+
+    /// Network error contacting the target.
+    #[error("transfer_to failed: network error: {0}")]
+    Network(String),
+
+    /// The Raft core has shut down or hit a fatal error.
+    #[error("transfer_to failed: raft core fatal error")]
+    Fatal,
+}
+
 impl<NID: NodeId> From<RejectVoteRequest<NID>> for AppendEntriesResponse<NID> {
     fn from(r: RejectVoteRequest<NID>) -> Self {
         match r {

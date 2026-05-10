@@ -3,6 +3,7 @@
 use std::fmt;
 
 use crate::core::raft_msg::ResultSender;
+use crate::error::TransferError;
 use crate::RaftTypeConfig;
 use crate::Snapshot;
 
@@ -31,6 +32,19 @@ pub(crate) enum ExternalCommand<C: RaftTypeConfig> {
     ///
     /// [`max_in_snapshot_log_to_keep`]: `crate::Config::max_in_snapshot_log_to_keep`
     PurgeLog { upto: u64 },
+
+    /// Initiate the leadership-transfer dispatch step (ferrosa fork — ADR-012, W3.9).
+    ///
+    /// Sent by `Trigger::transfer_to` after it has confirmed the local node is leader
+    /// and the target is caught up. RaftCore handles this by sending a TimeoutNow RPC
+    /// to the target via the network factory and signalling the result via `tx`.
+    ///
+    /// `Trigger::transfer_to` then watches the metrics channel for the leader change
+    /// (or times out).
+    SendTimeoutNow {
+        target: C::NodeId,
+        tx: ResultSender<C, (), TransferError<C::NodeId>>,
+    },
 }
 
 impl<C> fmt::Debug for ExternalCommand<C>
@@ -60,6 +74,9 @@ where C: RaftTypeConfig
             }
             ExternalCommand::PurgeLog { upto } => {
                 write!(f, "PurgeLog[..={}]", upto)
+            }
+            ExternalCommand::SendTimeoutNow { target, .. } => {
+                write!(f, "SendTimeoutNow(target={})", target)
             }
         }
     }

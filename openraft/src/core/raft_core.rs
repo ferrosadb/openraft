@@ -1247,6 +1247,9 @@ where
                     ExternalCommand::PurgeLog { upto } => {
                         self.engine.trigger_purge_log(upto);
                     }
+                    ExternalCommand::SendTimeoutNow { target, tx } => {
+                        self.handle_send_timeout_now(target, tx).await;
+                    }
                 }
             }
         };
@@ -1569,6 +1572,115 @@ where
             // Surrender lease and step down. The engine's vote handler will
             // re-evaluate server state (Leader → Follower) on next state read.
             self.engine.leader_step_down();
+        }
+    }
+
+    /// Dispatch a `TimeoutNow` directive to a leadership-transfer target
+    /// (ferrosa fork — ADR-012, W3.9).
+    ///
+    /// Preconditions checked here:
+    /// - This node is currently a leader.
+    /// - The target is a voter in the effective membership.
+    /// - The target's replication progress has caught up to the leader's last log id.
+    ///
+    /// On success, the TimeoutNow RPC has been sent and the target acked it. The
+    /// caller (`Trigger::transfer_to`) is responsible for watching the metrics
+    /// channel for the actual leader change (and timing out if it doesn't happen).
+    #[tracing::instrument(level = "debug", skip_all, fields(target=display(&target)))]
+    async fn handle_send_timeout_now(
+        &mut self,
+        target: C::NodeId,
+        tx: ResultSender<C, (), crate::error::TransferError<C::NodeId>>,
+    ) {
+        use crate::async_runtime::AsyncOneshotSendExt;
+
+        // 1. Verify we are leader.
+        if self.engine.state.server_state != ServerState::Leader {
+            let _ = tx.send(Err(crate::error::TransferError::NotLeader));
+            return;
+        }
+
+        // 2. Reject self-target.
+        if self.id == target {
+            let _ = tx.send(Err(crate::error::TransferError::TargetIsSelf(target.clone())));
+            return;
+        }
+
+        // 3. Verify target is a voter.
+        let eff_mem = self.engine.state.membership_state.effective().clone();
+        if !eff_mem.is_voter(&target) {
+            let _ = tx.send(Err(crate::error::TransferError::TargetNotVoter(target.clone())));
+            return;
+        }
+
+        // 4. Verify target is caught up. The leader's catch-up loop is in
+        //    `Trigger::transfer_to`; here we do a final check.
+        let leader_last = self.engine.state.last_log_id().cloned();
+        let matched: Option<LogId<C::NodeId>> = if let Some(leader) = self.engine.leader.as_ref() {
+            // Find the target in the leader's progress map.
+            leader
+                .progress
+                .iter()
+                .find(|(id, _)| *id == target)
+                .and_then(|(_, entry)| entry.matching.clone())
+        } else {
+            None
+        };
+
+        // The replication "matched" must be >= leader's last_log_id. If matched is None,
+        // target hasn't acked anything yet — refuse.
+        let caught_up = match (matched.as_ref(), leader_last.as_ref()) {
+            (Some(m), Some(ll)) => m.index >= ll.index,
+            (None, None) => true,
+            (None, Some(_)) => false,
+            (Some(_), None) => true,
+        };
+
+        if !caught_up {
+            let _ = tx.send(Err(crate::error::TransferError::TargetTooFarBehind {
+                target: target.clone(),
+                matched: matched.clone(),
+                leader_last: leader_last.clone(),
+            }));
+            return;
+        }
+
+        // 5. Build and send the TimeoutNow RPC.
+        let my_vote = self.engine.state.vote_ref().clone();
+        let req = crate::raft::TimeoutNowRequest::new(my_vote, leader_last);
+
+        let target_node = match eff_mem.get_node(&target) {
+            Some(n) => n.clone(),
+            None => {
+                // Race: voter present but node info missing. Refuse.
+                let _ = tx.send(Err(crate::error::TransferError::TargetNotVoter(target.clone())));
+                return;
+            }
+        };
+
+        let mut client = self.network.new_client(target.clone(), &target_node).await;
+        let option = RPCOption::new(Duration::from_millis(self.config.election_timeout_max));
+
+        match client.timeout_now(req, option).await {
+            Ok(resp) => {
+                if resp.started_election {
+                    tracing::info!(target = display(&target), "TimeoutNow accepted by target");
+                    // Voluntary step-down: stop heartbeating and surrender our committed vote
+                    // so followers' leases age out and they grant the target's VoteRequest.
+                    // (Per ADR-012, this is the simple "stop heartbeats" path described in the
+                    // spec doc — the alternative explicit lease-surrender broadcast is a wire
+                    // change and was deferred.)
+                    self.engine.leader_step_down();
+                    let _ = tx.send(Ok(()));
+                } else {
+                    tracing::warn!(target = display(&target), "target refused TimeoutNow directive");
+                    let _ = tx.send(Err(crate::error::TransferError::TargetRefused(target.clone())));
+                }
+            }
+            Err(e) => {
+                tracing::error!(target = display(&target), error = display(&e), "network error sending TimeoutNow");
+                let _ = tx.send(Err(crate::error::TransferError::Network(e.to_string())));
+            }
         }
     }
 

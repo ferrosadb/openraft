@@ -43,6 +43,10 @@ use openraft::raft::AppendEntriesResponse;
 use openraft::raft::ClientWriteResponse;
 use openraft::raft::InstallSnapshotRequest;
 use openraft::raft::InstallSnapshotResponse;
+use openraft::raft::PreVoteRequest;
+use openraft::raft::PreVoteResponse;
+use openraft::raft::TimeoutNowRequest;
+use openraft::raft::TimeoutNowResponse;
 use openraft::raft::VoteRequest;
 use openraft::raft::VoteResponse;
 use openraft::storage::Adaptor;
@@ -1111,6 +1115,46 @@ impl RaftNetwork<MemConfig> for RaftRouterNetwork {
         let node = self.owner.get_raft_handle(&self.target)?;
 
         let resp = node.vote(rpc).await;
+        let resp = resp.map_err(|e| RemoteError::new(self.target, e))?;
+
+        Ok(resp)
+    }
+
+    /// Send a PreVote probe to the target Raft node (ferrosa fork — ADR-012, Ongaro Sec 9.6).
+    async fn pre_vote(
+        &mut self,
+        rpc: PreVoteRequest<MemNodeId>,
+        _option: RPCOption,
+    ) -> Result<PreVoteResponse<MemNodeId>, RPCError<MemNodeId, (), RaftError<MemNodeId>>> {
+        let from_id = rpc.vote.leader_id().voted_for().unwrap();
+
+        self.owner.count_rpc(RPCTypes::PreVote);
+        self.owner.emit_rpc_error(from_id, self.target)?;
+        self.owner.rand_send_delay().await;
+
+        let node = self.owner.get_raft_handle(&self.target)?;
+
+        let resp = node.pre_vote(rpc).await;
+        let resp = resp.map_err(|e| RemoteError::new(self.target, e))?;
+
+        Ok(resp)
+    }
+
+    /// Send a TimeoutNow directive to the target Raft node (ferrosa fork — ADR-012, Ongaro Sec 3.10).
+    async fn timeout_now(
+        &mut self,
+        rpc: TimeoutNowRequest<MemNodeId>,
+        _option: RPCOption,
+    ) -> Result<TimeoutNowResponse<MemNodeId>, RPCError<MemNodeId, (), RaftError<MemNodeId>>> {
+        let from_id = rpc.vote.leader_id().voted_for().unwrap();
+
+        self.owner.count_rpc(RPCTypes::TimeoutNow);
+        self.owner.emit_rpc_error(from_id, self.target)?;
+        self.owner.rand_send_delay().await;
+
+        let node = self.owner.get_raft_handle(&self.target)?;
+
+        let resp = node.timeout_now(rpc).await;
         let resp = resp.map_err(|e| RemoteError::new(self.target, e))?;
 
         Ok(resp)
