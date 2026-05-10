@@ -474,6 +474,12 @@ impl fmt::Display for PayloadTooLarge {
             RPCTypes::Vote => {
                 unreachable!("vote rpc should not have payload")
             }
+            RPCTypes::PreVote => {
+                unreachable!("pre-vote rpc should not have payload")
+            }
+            RPCTypes::TimeoutNow => {
+                unreachable!("timeout-now rpc should not have payload")
+            }
             RPCTypes::AppendEntries => {
                 write!(f, "entries:{}", self.entries_hint)?;
             }

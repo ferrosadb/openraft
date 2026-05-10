@@ -239,6 +239,43 @@ pub struct Config {
            default_missing_value = "true"
     )]
     pub enable_elect: bool,
+
+    /// Enable PreVote (Ongaro §9.6) — ferrosa fork extension per ADR-012.
+    ///
+    /// When `true`, a follower whose election timer fires enters
+    /// `PreCandidate` state and probes peers with `PreVoteRequest` instead of
+    /// immediately incrementing its term and starting a real election. Term is
+    /// only advanced once a majority pre-grants. This prevents the
+    /// runaway-term failure mode (see
+    /// `bug-raft-stale-candidate-runaway-term-no-prevote.md`) where a
+    /// partitioned node disrupts cluster on rejoin.
+    ///
+    /// Default: `false` (matches upstream openraft 0.9 behavior). Ferrosa
+    /// builds set this to `true`.
+    #[clap(long,
+           default_value_t = false,
+           action = clap::ArgAction::Set,
+           num_args = 0..=1,
+           default_missing_value = "true"
+    )]
+    pub enable_pre_vote: bool,
+
+    /// CheckQuorum step-down ratio (Ongaro §6.4) — ferrosa fork extension per
+    /// ADR-012.
+    ///
+    /// Every `heartbeat_interval`, a leader checks whether it has received
+    /// AppendEntries acks from a majority within the last
+    /// `election_timeout_max × check_quorum_ratio` window. If not, it
+    /// voluntarily transitions to Follower and surrenders its lease.
+    ///
+    /// Range: `(0.0, 2.0]`. Special value `0.0` disables CheckQuorum
+    /// (upstream-compatible behavior).
+    ///
+    /// Default: `0.0` (disabled, upstream-compatible). Ferrosa builds set this
+    /// to `0.75` per ADR-012 — earlier step-down than etcd's 1.0 to fit
+    /// ferrosa's long election timeout.
+    #[clap(long, default_value_t = 0.0)]
+    pub check_quorum_ratio: f64,
 }
 
 /// Updatable config for a raft runtime.
@@ -318,6 +355,26 @@ impl Config {
             return Err(ConfigError::MaxPayloadIs0);
         }
 
+        if !(0.0..=2.0).contains(&self.check_quorum_ratio) {
+            return Err(ConfigError::invalid_check_quorum_ratio(self.check_quorum_ratio));
+        }
+
         Ok(self)
+    }
+}
+
+impl Config {
+    /// Whether CheckQuorum (Ongaro §6.4) is enabled — non-zero ratio. See ADR-012.
+    pub fn is_check_quorum_enabled(&self) -> bool {
+        self.check_quorum_ratio > 0.0
+    }
+
+    /// CheckQuorum step-down deadline window in milliseconds, or `None` if
+    /// CheckQuorum is disabled. See ADR-012.
+    pub fn check_quorum_deadline_ms(&self) -> Option<u64> {
+        if !self.is_check_quorum_enabled() {
+            return None;
+        }
+        Some((self.election_timeout_max as f64 * self.check_quorum_ratio) as u64)
     }
 }

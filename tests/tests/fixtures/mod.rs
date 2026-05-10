@@ -194,6 +194,12 @@ impl RPCErrorType {
                 RPCTypes::Vote => {
                     unreachable!("Vote RPC should not be too large")
                 }
+                RPCTypes::PreVote => {
+                    unreachable!("PreVote RPC should not be too large")
+                }
+                RPCTypes::TimeoutNow => {
+                    unreachable!("TimeoutNow RPC should not be too large")
+                }
                 RPCTypes::AppendEntries => PayloadTooLarge::new_entries_hint(*entries_hint).into(),
                 RPCTypes::InstallSnapshot => {
                     unreachable!("InstallSnapshot RPC should not be too large")

@@ -341,6 +341,12 @@ where
             RPCTypes::Vote => {
                 unreachable!("Vote RPC should not be too large")
             }
+            RPCTypes::PreVote => {
+                unreachable!("PreVote RPC should not be too large")
+            }
+            RPCTypes::TimeoutNow => {
+                unreachable!("TimeoutNow RPC should not be too large")
+            }
             RPCTypes::AppendEntries => {
                 self.entries_hint = ReplicationHint::new(too_large.entries_hint(), DEFAULT_ENTRIES_HINT_TTL);
                 tracing::debug!(entries_hint = debug(&self.entries_hint), "updated entries hint");

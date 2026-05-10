@@ -5,6 +5,8 @@
 
 mod append_entries;
 mod install_snapshot;
+mod pre_vote;
+mod timeout_now;
 mod vote;
 
 mod client_write;
@@ -16,5 +18,9 @@ pub use client_write::ClientWriteResult;
 pub use install_snapshot::InstallSnapshotRequest;
 pub use install_snapshot::InstallSnapshotResponse;
 pub use install_snapshot::SnapshotResponse;
+pub use pre_vote::PreVoteRequest;
+pub use pre_vote::PreVoteResponse;
+pub use timeout_now::TimeoutNowRequest;
+pub use timeout_now::TimeoutNowResponse;
 pub use vote::VoteRequest;
 pub use vote::VoteResponse;

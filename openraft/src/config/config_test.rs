@@ -162,3 +162,69 @@ fn test_config_enable_elect() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+/// W3.1 — `enable_pre_vote` is a Config field, default off (upstream-compatible),
+/// settable via CLI / clap.
+#[test]
+fn test_config_enable_pre_vote() -> anyhow::Result<()> {
+    let config = Config::default();
+    assert!(!config.enable_pre_vote, "default must match upstream openraft 0.9 behavior");
+
+    let config = Config::build(&["foo", "--enable-pre-vote=true"])?;
+    assert!(config.enable_pre_vote);
+
+    let config = Config::build(&["foo", "--enable-pre-vote"])?;
+    assert!(config.enable_pre_vote);
+
+    Ok(())
+}
+
+/// W3.5 — `check_quorum_ratio` is a Config field. Default 0.0 means upstream-compatible
+/// (CheckQuorum disabled). Ferrosa builds set 0.75 per ADR-012.
+#[test]
+fn test_config_check_quorum_ratio_default_disabled() -> anyhow::Result<()> {
+    let config = Config::default();
+    assert_eq!(config.check_quorum_ratio, 0.0);
+    assert!(!config.is_check_quorum_enabled());
+    assert_eq!(config.check_quorum_deadline_ms(), None);
+    Ok(())
+}
+
+#[test]
+fn test_config_check_quorum_ratio_ferrosa_default() -> anyhow::Result<()> {
+    // The ferrosa default per ADR-012.
+    let config = Config::build(&[
+        "foo",
+        "--election-timeout-min=3000",
+        "--election-timeout-max=6000",
+        "--heartbeat-interval=300",
+        "--check-quorum-ratio=0.75",
+    ])?
+    .validate()?;
+    assert_eq!(config.check_quorum_ratio, 0.75);
+    assert!(config.is_check_quorum_enabled());
+    // 6000 * 0.75 = 4500 ms — see ADR-012 rationale.
+    assert_eq!(config.check_quorum_deadline_ms(), Some(4500));
+    Ok(())
+}
+
+#[test]
+fn test_config_check_quorum_ratio_validation_rejects_out_of_range() {
+    let config = Config {
+        check_quorum_ratio: -0.1,
+        ..Default::default()
+    };
+    assert!(matches!(
+        config.validate(),
+        Err(ConfigError::InvalidCheckQuorumRatio { .. })
+    ));
+
+    let config = Config {
+        check_quorum_ratio: 2.5,
+        ..Default::default()
+    };
+    assert!(matches!(
+        config.validate(),
+        Err(ConfigError::InvalidCheckQuorumRatio { .. })
+    ));
+}

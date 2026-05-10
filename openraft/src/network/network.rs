@@ -12,7 +12,11 @@ use crate::network::rpc_option::RPCOption;
 use crate::network::Backoff;
 use crate::raft::AppendEntriesRequest;
 use crate::raft::AppendEntriesResponse;
+use crate::raft::PreVoteRequest;
+use crate::raft::PreVoteResponse;
 use crate::raft::SnapshotResponse;
+use crate::raft::TimeoutNowRequest;
+use crate::raft::TimeoutNowResponse;
 use crate::raft::VoteRequest;
 use crate::raft::VoteResponse;
 use crate::OptionalSend;
@@ -20,6 +24,17 @@ use crate::OptionalSync;
 use crate::RaftTypeConfig;
 use crate::Snapshot;
 use crate::Vote;
+
+/// Sentinel error used by the default `pre_vote` / `timeout_now` impls in
+/// `RaftNetwork`. Network impls that opt in to ADR-012's protocol extensions
+/// override the default and never produce this. Existing impls (memstore,
+/// downstream applications) inherit the default and surface this error if
+/// someone calls the method without overriding.
+#[derive(Debug, thiserror::Error)]
+#[error("ferrosa fork: RaftNetwork::{method} is not implemented by this network impl")]
+struct FerrosaUnimplemented {
+    method: &'static str,
+}
 
 /// A trait defining the interface for a Raft network between cluster members.
 ///
@@ -78,6 +93,43 @@ where C: RaftTypeConfig
         rpc: VoteRequest<C::NodeId>,
         option: RPCOption,
     ) -> Result<VoteResponse<C::NodeId>, RPCError<C::NodeId, C::Node, RaftError<C::NodeId>>>;
+
+    /// Send a PreVote probe to the target (ferrosa fork — Ongaro §9.6).
+    ///
+    /// PreVote is a non-mutating probe used by a node that suspects the leader is dead
+    /// but has not yet committed to incrementing its term. Receivers reject if they
+    /// have heard from the current leader within the last election timeout.
+    ///
+    /// The default implementation returns a `NetworkError` with kind "unimplemented"
+    /// so existing `RaftNetwork` impls keep compiling. Network impls that opt in to
+    /// PreVote (per ADR-012) override this method. Until the engine wires PreCandidate
+    /// state through `core::raft_msg`, this trait method is the public surface only.
+    async fn pre_vote(
+        &mut self,
+        _rpc: PreVoteRequest<C::NodeId>,
+        _option: RPCOption,
+    ) -> Result<PreVoteResponse<C::NodeId>, RPCError<C::NodeId, C::Node, RaftError<C::NodeId>>> {
+        Err(RPCError::Network(crate::error::NetworkError::new(&FerrosaUnimplemented {
+            method: "pre_vote",
+        })))
+    }
+
+    /// Send a TimeoutNow directive to the target (ferrosa fork — Ongaro §3.10).
+    ///
+    /// Used by a leader transferring leadership to instruct a specific follower to
+    /// immediately start an election. The follower skips both the election timer and
+    /// the PreVote phase (the directive is by trusted leader authority).
+    ///
+    /// Default impl returns a `NetworkError` so existing impls compile. See ADR-012.
+    async fn timeout_now(
+        &mut self,
+        _rpc: TimeoutNowRequest<C::NodeId>,
+        _option: RPCOption,
+    ) -> Result<TimeoutNowResponse<C::NodeId>, RPCError<C::NodeId, C::Node, RaftError<C::NodeId>>> {
+        Err(RPCError::Network(crate::error::NetworkError::new(&FerrosaUnimplemented {
+            method: "timeout_now",
+        })))
+    }
 
     /// Send a complete Snapshot to the target.
     ///
