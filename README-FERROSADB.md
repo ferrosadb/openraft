@@ -62,7 +62,7 @@ timer.
 ### Pre-existing patch already on this fork
 
 The branch `fix/separate-replication-timeout` (already merged into
-`correctness/prevote-checkquorum`) splits `replication_lag_timeout` from
+`main`) splits `replication_lag_timeout` from
 `heartbeat_interval`. Upstream conflates the two; under sled disk-IO
 contention this caused perpetual replication timeouts in Ferrosa.
 
@@ -90,7 +90,7 @@ Concretely:
 2. **Evaluate openraft 1.0 migration when stable**. ADR-018 in the
    Ferrosa repo lays out the criteria. Until then, we stay on 0.9.x.
 
-3. **CI**: every push to `correctness/prevote-checkquorum` runs the full
+3. **CI**: every push to `main` runs the full
    upstream test suite (`cargo test`) plus our additional tests
    (`tests/tests/elect/t12_pre_vote_basic.rs`,
    `tests/tests/membership/t90_transfer_leader.rs`,
@@ -118,12 +118,15 @@ Concretely:
 
 ## Branches
 
-- `main` — tracks upstream `databendlabs/openraft` `main`. Read-only.
-- `correctness/prevote-checkquorum` — **production branch for Ferrosa**;
-  carries all patches. This is what `ferrosa-suite` Cargo.toml's
-  `[patch.crates-io]` points at.
+- `main` — **production branch for Ferrosa**; carries all patches on
+  top of upstream `release-0.9.x`. This is what `ferrosa-suite`
+  Cargo.toml's `[patch.crates-io]` points at, and the default branch
+  of this repo.
+- `upstream-0.10-mirror` — read-only mirror of upstream `databendlabs/
+  openraft` `main` (the 0.10 line). Kept for reference; not used by
+  Ferrosa, which stays on 0.9.x per ADR-018.
 - `fix/separate-replication-timeout` — historical patch branch, now
-  rolled into `correctness/prevote-checkquorum`. Kept for reference.
+  rolled into `main`. Kept for reference.
 
 ## Configuration knobs added by this fork
 
