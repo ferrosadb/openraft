@@ -1,3 +1,5 @@
+> ⚠️ **You are looking at the [`ferrosadb/openraft`](https://github.com/ferrosadb/openraft) fork.** It carries patches Ferrosa needs that are not in upstream. Read [**README-FERROSADB.md**](./README-FERROSADB.md) for the rationale and maintenance commitment. End users of openraft should use [upstream](https://github.com/databendlabs/openraft).
+
 <div align="center">
     <h1>Openraft</h1>
     <h4>

@@ -22,7 +22,7 @@ chrono          = { workspace = true }
 clap            = { workspace = true }
 derive_more     = { workspace = true }
 futures         = { workspace = true }
-openraft-macros = { path = "../macros", version = "0.9.6" }
+openraft-macros = { path = "../macros", version = "0.9.25+ferrosadb.1" }
 maplit          = { workspace = true }
 rand            = { workspace = true }
 serde           = { workspace = true, optional = true }
