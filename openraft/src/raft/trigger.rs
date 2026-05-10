@@ -197,15 +197,15 @@ where C: RaftTypeConfig
         }
 
         // 4. Watch metrics for the target winning the election. Deadline is
-        //    `election_timeout_max × 3` after dispatch (W3.10).
+        //    `election_timeout_max × 5` after dispatch (W3.10).
         //
-        //    Why 3x: with the simple "stop heartbeats" stepdown path (per the spec doc),
+        //    Why 5x: with the simple "stop heartbeats" stepdown path (per the spec doc),
         //    followers must wait up to `leader_lease == election_timeout_max` before
         //    their lease expires and they can grant a vote. The election round itself
         //    takes up to `election_timeout_max` more, so 2x is the theoretical minimum.
-        //    We add 1x slack for scheduling/RPC latency.
+        //    We add 3x slack for scheduling/RPC latency under contended test runs.
         let deadline = std::time::Instant::now()
-            + Duration::from_millis(self.raft_inner.config.election_timeout_max.saturating_mul(3));
+            + Duration::from_millis(self.raft_inner.config.election_timeout_max.saturating_mul(5));
 
         loop {
             let m = metrics_rx.borrow().clone();

@@ -940,7 +940,7 @@ where
 
                 notify_res = self.rx_notify.recv() => {
                     match notify_res {
-                        Some(notify) => self.handle_notify(notify)?,
+                        Some(notify) => self.handle_notify(notify).await?,
                         None => {
                             tracing::error!("all rx_notify senders are dropped");
                             return Err(Fatal::Stopped);
@@ -1037,7 +1037,7 @@ where
                 },
             };
 
-            self.handle_notify(notify)?;
+            self.handle_notify(notify).await?;
 
             // TODO: does run_engine_commands() run too frequently?
             //       to run many commands in one shot, it is possible to batch more commands to gain
@@ -1257,7 +1257,7 @@ where
 
     // TODO: Make this method non-async. It does not need to run any async command in it.
     #[tracing::instrument(level = "debug", skip_all, fields(state = debug(self.engine.state.server_state), id=display(&self.id)))]
-    pub(crate) fn handle_notify(&mut self, notify: Notify<C>) -> Result<(), Fatal<C::NodeId>> {
+    pub(crate) async fn handle_notify(&mut self, notify: Notify<C>) -> Result<(), Fatal<C::NodeId>> {
         tracing::debug!("recv from rx_notify: {}", notify.summary());
 
         match notify {
@@ -1305,7 +1305,7 @@ where
                 let now = C::now();
                 tracing::debug!("received tick: {}, now: {:?}", i, now);
 
-                self.handle_tick_election();
+                self.handle_tick_election().await;
                 self.handle_tick_check_quorum(now);
 
                 // TODO: test: fixture: make isolated_nodes a single-way isolating.
@@ -1459,7 +1459,7 @@ where
     }
 
     #[tracing::instrument(level = "debug", skip_all)]
-    fn handle_tick_election(&mut self) {
+    async fn handle_tick_election(&mut self) {
         let now = C::now();
 
         tracing::debug!("try to trigger election by tick, now: {:?}", now);
@@ -1524,8 +1524,103 @@ where
         // Every time elect, reset this flag.
         self.engine.reset_greater_log();
 
+        // Ferrosa fork — ADR-012, W3.3: if PreVote is enabled, run a pre-vote
+        // round before incrementing the term. Only proceed to a real election
+        // if a quorum of peers grants the pre-vote.
+        //
+        // This breaks the runaway-term cascade documented in
+        // bug-raft-stale-candidate-runaway-term-no-prevote.md: a partitioned
+        // candidate whose pre-votes are rejected (by lease check or stale log)
+        // never advances its persistent term.
+        if self.config.enable_pre_vote {
+            tracing::info!("pre-vote enabled — running pre-vote round before election");
+            let granted = self.run_pre_vote_round().await;
+            if !granted {
+                tracing::info!("pre-vote round did not reach quorum; staying follower (no term advance)");
+                return;
+            }
+            tracing::info!("pre-vote round won quorum; proceeding to real election");
+        }
+
         tracing::info!("do trigger election");
         self.engine.elect();
+    }
+
+    /// Run a synchronous PreVote round (ferrosa fork — ADR-012, W3.3).
+    ///
+    /// Sends `PreVoteRequest` to every voter peer with the *prospective* next
+    /// term but WITHOUT incrementing this node's persistent term. Returns
+    /// `true` iff a quorum of voters (including self) pre-grant.
+    ///
+    /// On rejection (or RPC failure), the result counts as a "no" vote — the
+    /// candidate stays in Follower state.
+    async fn run_pre_vote_round(&mut self) -> bool {
+        let prospective_term = self.engine.state.vote_ref().leader_id().get_term() + 1;
+        let prospective_vote = Vote::new(prospective_term, self.id.clone());
+        let last_log_id = self.engine.state.last_log_id().cloned();
+        let req = crate::raft::PreVoteRequest::new(prospective_vote, last_log_id);
+
+        let eff_mem = self.engine.state.membership_state.effective().clone();
+        let voter_ids: Vec<C::NodeId> = eff_mem.membership().voter_ids().collect();
+
+        // Self-grant.
+        let mut granted = std::collections::BTreeSet::new();
+        granted.insert(self.id.clone());
+
+        let quorum_set = eff_mem.membership().to_quorum_set();
+        use crate::quorum::QuorumSet;
+
+        // Fast-path: single-voter cluster — self is already a quorum.
+        if quorum_set.is_quorum(granted.iter()) {
+            return true;
+        }
+
+        let ttl = Duration::from_millis(self.config.election_timeout_max);
+        let option = RPCOption::new(ttl);
+
+        // Send pre-vote RPCs to all peer voters in parallel.
+        let mut peer_futures = Vec::new();
+        for peer in voter_ids.iter().filter(|p| **p != self.id) {
+            let target_node = match eff_mem.get_node(peer) {
+                Some(n) => n.clone(),
+                None => continue,
+            };
+            let mut client = self.network.new_client(peer.clone(), &target_node).await;
+            let req_clone = req.clone();
+            let opt_clone = option.clone();
+            let peer_id = peer.clone();
+            let fu = async move {
+                let res = C::AsyncRuntime::timeout(ttl, client.pre_vote(req_clone, opt_clone)).await;
+                (peer_id, res)
+            };
+            peer_futures.push(C::AsyncRuntime::spawn(fu));
+        }
+
+        // Collect responses, count grants until quorum reached or all responses processed.
+        for jh in peer_futures {
+            match jh.await {
+                Ok((peer_id, Ok(Ok(resp)))) => {
+                    if resp.vote_granted {
+                        granted.insert(peer_id);
+                        if quorum_set.is_quorum(granted.iter()) {
+                            return true;
+                        }
+                    }
+                }
+                Ok((peer_id, Ok(Err(e)))) => {
+                    tracing::debug!(peer = display(&peer_id), error = display(&e), "pre-vote RPC error");
+                }
+                Ok((peer_id, Err(_))) => {
+                    tracing::debug!(peer = display(&peer_id), "pre-vote RPC timeout");
+                }
+                Err(_e) => {
+                    tracing::debug!("pre-vote spawn join error");
+                }
+            }
+        }
+
+        // Final tally.
+        quorum_set.is_quorum(granted.iter())
     }
 
     /// CheckQuorum tick handler (Ongaro §6.4) — ferrosa fork extension per ADR-012.
