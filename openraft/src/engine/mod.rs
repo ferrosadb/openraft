@@ -44,6 +44,8 @@ pub(crate) mod time_state;
 mod tests {
     mod append_entries_test;
     mod elect_test;
+    mod handle_pre_vote_req_test;
+    mod handle_timeout_now_test;
     mod handle_vote_req_test;
     mod handle_vote_resp_test;
     mod initialize_test;

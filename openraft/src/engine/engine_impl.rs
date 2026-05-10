@@ -36,7 +36,11 @@ use crate::proposer::LeaderQuorumSet;
 use crate::proposer::LeaderState;
 use crate::raft::responder::Responder;
 use crate::raft::AppendEntriesResponse;
+use crate::raft::PreVoteRequest;
+use crate::raft::PreVoteResponse;
 use crate::raft::SnapshotResponse;
+use crate::raft::TimeoutNowRequest;
+use crate::raft::TimeoutNowResponse;
 use crate::raft::VoteRequest;
 use crate::raft::VoteResponse;
 use crate::raft_state::LogStateReader;
@@ -402,6 +406,118 @@ where C: RaftTypeConfig
 
         // Update if resp.vote is greater.
         let _ = self.vote_handler().update_vote(&vote);
+    }
+
+    /// Handle a `PreVoteRequest` (Ongaro §9.6) — ferrosa fork extension per
+    /// ADR-012 (W3.3, W3.7).
+    ///
+    /// PreVote is a non-mutating probe used by a node that suspects the leader
+    /// is dead but has not yet committed to incrementing its term. Receivers
+    /// reject if they have heard from the current leader within the last
+    /// election timeout (lease-aware rejection), or if the candidate's log is
+    /// not at least as up-to-date as theirs.
+    ///
+    /// Crucially, this handler does **NOT** mutate any persistent vote state —
+    /// the request's `vote` is purely advisory.
+    #[tracing::instrument(level = "debug", skip_all)]
+    pub(crate) fn handle_pre_vote_req(&mut self, req: PreVoteRequest<C::NodeId>) -> PreVoteResponse<C::NodeId> {
+        let now = C::now();
+        let lease = self.config.timer_config.leader_lease;
+        let vote = self.state.vote_ref();
+
+        tracing::info!(req = display(req.summary()), "Engine::handle_pre_vote_req");
+
+        // Compute the lease status using the same primitives as `handle_vote_req`:
+        // we treat `vote_last_modified` as the "last heard from leader" timestamp
+        // when the local vote is committed. If the local vote is not committed,
+        // the lease has not been granted to anyone — treat as expired.
+        let lease_status = if vote.is_committed() {
+            match self.state.vote_last_modified() {
+                Some(t) => {
+                    let elapsed = now - t;
+                    if elapsed < lease {
+                        crate::engine::LeaseStatus::Active {
+                            remaining: lease - elapsed,
+                        }
+                    } else {
+                        crate::engine::LeaseStatus::Expired
+                    }
+                }
+                None => crate::engine::LeaseStatus::Expired,
+            }
+        } else {
+            crate::engine::LeaseStatus::Expired
+        };
+
+        let decision = crate::engine::evaluate_pre_vote(
+            req.vote.leader_id().get_term(),
+            vote.leader_id().get_term(),
+            req.last_log_id.as_ref(),
+            self.state.last_log_id(),
+            lease_status,
+        );
+
+        tracing::info!(
+            ?decision,
+            "PreVote decision (W3.2: lease-aware): {:?}",
+            decision
+        );
+
+        PreVoteResponse {
+            vote: vote.clone(),
+            vote_granted: decision.is_granted(),
+            last_log_id: self.state.last_log_id().cloned(),
+        }
+    }
+
+    /// Handle a `TimeoutNowRequest` (Ongaro §3.10) — ferrosa fork extension per
+    /// ADR-012 (W3.8).
+    ///
+    /// `TimeoutNow` is sent by a leader transferring leadership to instruct a
+    /// specific follower to immediately start an election. The follower skips
+    /// both the election timer AND the PreVote phase — the directive is by
+    /// trusted leader authority, so it goes straight to a real Vote round.
+    ///
+    /// Defense-in-depth checks:
+    /// - Reject if `req.vote.term < self.current_term` (stale directive).
+    /// - Reject if our `last_log_id < req.last_log_id` (we're genuinely behind).
+    #[tracing::instrument(level = "debug", skip_all)]
+    pub(crate) fn handle_timeout_now_req(
+        &mut self,
+        req: TimeoutNowRequest<C::NodeId>,
+    ) -> TimeoutNowResponse<C::NodeId> {
+        tracing::info!(req = display(req.summary()), "Engine::handle_timeout_now_req");
+
+        let my_term = self.state.vote_ref().leader_id().get_term();
+        let req_term = req.vote.leader_id().get_term();
+
+        if req_term < my_term {
+            tracing::warn!(
+                req_term,
+                my_term,
+                "TimeoutNow rejected: sender's term is stale"
+            );
+            return TimeoutNowResponse::new(self.state.vote_ref(), false);
+        }
+
+        // Defense-in-depth: refuse if our log is genuinely behind the leader's
+        // at transfer time. (The leader's `transfer_to` is supposed to ensure
+        // we're caught up first; this guards against bugs there.)
+        if self.state.last_log_id().cloned() < req.last_log_id {
+            tracing::warn!(
+                my_last_log_id = display(self.state.last_log_id().summary()),
+                req_last_log_id = display(req.last_log_id.summary()),
+                "TimeoutNow refused: local log is behind leader's"
+            );
+            return TimeoutNowResponse::new(self.state.vote_ref(), false);
+        }
+
+        // Accept the directive: transition directly to Candidate by running a
+        // standard election (skipping the PreVote phase). This advances our
+        // term, persists a vote-for-self, and emits a SendVote command.
+        self.elect();
+
+        TimeoutNowResponse::new(self.state.vote_ref(), true)
     }
 
     /// Append entries to follower/learner.
