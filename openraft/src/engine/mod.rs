@@ -33,7 +33,9 @@ mod command_kind;
 mod engine_config;
 mod engine_impl;
 mod engine_output;
+mod leader_lease;
 mod log_id_list;
+mod pre_vote_decision;
 
 pub(crate) mod handler;
 pub(crate) mod time_state;
@@ -55,6 +57,16 @@ pub(crate) mod testing;
 
 pub(crate) use check_quorum::CheckQuorum;
 pub(crate) use check_quorum::CheckQuorumDecision;
+#[allow(unused_imports)] // Used once `following_handler::handle_pre_vote_req` lands.
+pub(crate) use leader_lease::LeaderLease;
+#[allow(unused_imports)]
+pub(crate) use leader_lease::LeaseStatus;
+#[allow(unused_imports)] // Used once `following_handler::handle_pre_vote_req` lands.
+pub(crate) use pre_vote_decision::evaluate_pre_vote;
+#[allow(unused_imports)]
+pub(crate) use pre_vote_decision::is_log_up_to_date;
+#[allow(unused_imports)]
+pub(crate) use pre_vote_decision::PreVoteDecision;
 pub(crate) use command::Command;
 pub(crate) use command::Condition;
 pub(crate) use command::Respond;
