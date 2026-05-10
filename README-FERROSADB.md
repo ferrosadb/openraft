@@ -104,13 +104,13 @@ Concretely:
    placeholder.
 
 5. **Versioning**: `0.9.25+ferrosadb.N` denotes the Nth ferrosadb
-   patch series on top of upstream `0.9.21`. The numeric prefix is
-   chosen to satisfy `^0.9` requirements while remaining greater than
-   the latest upstream `0.9.x` (currently `0.9.24`); the `+ferrosadb.N`
-   build-metadata identifies the fork without affecting semver
-   precedence. When we rebase onto a future upstream `0.9.x` release,
-   the prefix advances to keep us greater than upstream while staying
-   in the `0.9` line.
+   patch series on top of upstream `0.9.24` (the latest upstream
+   `0.9.x` release). The numeric prefix is chosen to satisfy `^0.9`
+   requirements while remaining greater than upstream; the
+   `+ferrosadb.N` build-metadata identifies the fork without affecting
+   semver precedence. When we rebase onto a future upstream `0.9.x`
+   release the numeric prefix advances to stay one ahead of upstream
+   while remaining in the `0.9` line.
 
 6. **Public**: this fork is open-source under the same dual MIT /
    Apache-2.0 license as upstream. Other consumers can use it; we do
