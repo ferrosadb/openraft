@@ -1760,11 +1760,18 @@ where
             Ok(resp) => {
                 if resp.started_election {
                     tracing::info!(target = display(&target), "TimeoutNow accepted by target");
-                    // Voluntary step-down: stop heartbeating and surrender our committed vote
-                    // so followers' leases age out and they grant the target's VoteRequest.
-                    // (Per ADR-012, this is the simple "stop heartbeats" path described in the
-                    // spec doc — the alternative explicit lease-surrender broadcast is a wire
-                    // change and was deferred.)
+                    // Voluntary step-down (per ADR-012, "simple stop-heartbeats" path):
+                    //   - Disable heartbeat dispatch so followers' lease check stops being
+                    //     refreshed and they will grant the target's VoteRequest after
+                    //     `leader_lease` expires.
+                    //   - Call leader_step_down() so the engine reconsiders its server state
+                    //     once the membership pipeline allows it.
+                    //
+                    // This is the trade-off documented in sprint-03-openraft-patches.md:
+                    // adds up to election_timeout latency before the target can win, but
+                    // requires no wire-format change. The alternative (an explicit
+                    // lease-surrender AppendEntries variant) is a future optimization.
+                    self.runtime_config.enable_heartbeat.store(false, Ordering::Relaxed);
                     self.engine.leader_step_down();
                     let _ = tx.send(Ok(()));
                 } else {
