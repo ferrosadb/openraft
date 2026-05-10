@@ -27,6 +27,7 @@
 //!  <-------: command to run
 //! ```
 
+mod check_quorum;
 mod command;
 mod command_kind;
 mod engine_config;
@@ -52,6 +53,8 @@ mod tests {
 #[cfg(test)]
 pub(crate) mod testing;
 
+pub(crate) use check_quorum::CheckQuorum;
+pub(crate) use check_quorum::CheckQuorumDecision;
 pub(crate) use command::Command;
 pub(crate) use command::Condition;
 pub(crate) use command::Respond;

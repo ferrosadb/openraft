@@ -143,12 +143,20 @@ impl<C: RaftTypeConfig> Debug for ApplyResult<C> {
 pub(crate) struct LeaderData<C: RaftTypeConfig> {
     /// The time to send next heartbeat.
     pub(crate) next_heartbeat: <C::AsyncRuntime as AsyncRuntime>::Instant,
+
+    /// The instant at which this node became leader. Used by CheckQuorum
+    /// (Ongaro §6.4) to grant a grace period before stepping down on
+    /// "no acks yet" — see [`crate::engine::CheckQuorumDecision::NeverAcked`].
+    /// Ferrosa fork extension per ADR-012.
+    pub(crate) elected_at: <C::AsyncRuntime as AsyncRuntime>::Instant,
 }
 
 impl<C: RaftTypeConfig> LeaderData<C> {
     pub(crate) fn new() -> Self {
+        let now = C::now();
         Self {
-            next_heartbeat: C::now(),
+            next_heartbeat: now,
+            elected_at: now,
         }
     }
 }
@@ -1271,6 +1279,7 @@ where
                 tracing::debug!("received tick: {}, now: {:?}", i, now);
 
                 self.handle_tick_election();
+                self.handle_tick_check_quorum(now);
 
                 // TODO: test: fixture: make isolated_nodes a single-way isolating.
 
@@ -1490,6 +1499,53 @@ where
 
         tracing::info!("do trigger election");
         self.engine.elect();
+    }
+
+    /// CheckQuorum tick handler (Ongaro §6.4) — ferrosa fork extension per ADR-012.
+    ///
+    /// Every tick, if this node is a Leader, evaluate whether it has seen a
+    /// quorum AppendEntries ack within the configured `check_quorum_ratio ×
+    /// election_timeout_max` window. If not, voluntarily step down. Quiet
+    /// no-op when CheckQuorum is disabled (`check_quorum_ratio == 0.0`,
+    /// upstream-compatible default).
+    #[tracing::instrument(level = "debug", skip_all)]
+    fn handle_tick_check_quorum(&mut self, now: <C::AsyncRuntime as AsyncRuntime>::Instant) {
+        // Only leaders run CheckQuorum.
+        if self.engine.state.server_state != ServerState::Leader {
+            return;
+        }
+
+        let cq = crate::engine::CheckQuorum {
+            ratio: self.config.check_quorum_ratio,
+            election_timeout_max_ms: self.config.election_timeout_max,
+        };
+
+        // Fast path — disabled.
+        if cq.ratio <= 0.0 {
+            return;
+        }
+
+        let last_ack = self.last_quorum_acked_time();
+        let elapsed_since_ack = last_ack.map(|t| now - t);
+        let elapsed_since_election = self
+            .leader_data
+            .as_ref()
+            .map(|ld| now - ld.elected_at)
+            .unwrap_or_default();
+
+        let decision = cq.should_step_down(elapsed_since_ack, elapsed_since_election);
+
+        if decision.must_step_down() {
+            tracing::warn!(
+                ?decision,
+                check_quorum_ratio = cq.ratio,
+                election_timeout_max_ms = cq.election_timeout_max_ms,
+                "CheckQuorum: leader has lost quorum contact, stepping down (ADR-012, Ongaro §6.4)",
+            );
+            // Surrender lease and step down. The engine's vote handler will
+            // re-evaluate server state (Leader → Follower) on next state read.
+            self.engine.leader_step_down();
+        }
     }
 
     #[tracing::instrument(level = "debug", skip_all)]
