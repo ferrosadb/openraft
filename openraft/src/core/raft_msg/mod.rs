@@ -7,7 +7,11 @@ use crate::error::InitializeError;
 use crate::raft::AppendEntriesRequest;
 use crate::raft::AppendEntriesResponse;
 use crate::raft::BoxCoreFn;
+use crate::raft::PreVoteRequest;
+use crate::raft::PreVoteResponse;
 use crate::raft::SnapshotResponse;
+use crate::raft::TimeoutNowRequest;
+use crate::raft::TimeoutNowResponse;
 use crate::raft::VoteRequest;
 use crate::raft::VoteResponse;
 use crate::type_config::alias::LogIdOf;
@@ -30,6 +34,12 @@ pub(crate) type ResultSender<C, T, E = Infallible> = OneshotSenderOf<C, Result<T
 /// TX for Vote Response
 pub(crate) type VoteTx<C> = ResultSender<C, VoteResponse<NodeIdOf<C>>>;
 
+/// TX for PreVote Response (ferrosa fork — ADR-012, W3.3).
+pub(crate) type PreVoteTx<C> = ResultSender<C, PreVoteResponse<NodeIdOf<C>>>;
+
+/// TX for TimeoutNow Response (ferrosa fork — ADR-012, W3.8).
+pub(crate) type TimeoutNowTx<C> = ResultSender<C, TimeoutNowResponse<NodeIdOf<C>>>;
+
 /// TX for Append Entries Response
 pub(crate) type AppendEntriesTx<C> = ResultSender<C, AppendEntriesResponse<NodeIdOf<C>>>;
 
@@ -51,6 +61,22 @@ where C: RaftTypeConfig
     RequestVote {
         rpc: VoteRequest<C::NodeId>,
         tx: VoteTx<C>,
+    },
+
+    /// PreVote probe (ferrosa fork — ADR-012, Ongaro Sec 9.6).
+    /// Non-mutating probe asking "would you grant me a vote?" without
+    /// advancing any persistent term state.
+    RequestPreVote {
+        rpc: PreVoteRequest<C::NodeId>,
+        tx: PreVoteTx<C>,
+    },
+
+    /// TimeoutNow directive (ferrosa fork — ADR-012, Ongaro Sec 3.10).
+    /// Sent by a leader transferring leadership to instruct a specific
+    /// follower to immediately start an election (skipping PreVote).
+    TimeoutNow {
+        rpc: TimeoutNowRequest<C::NodeId>,
+        tx: TimeoutNowTx<C>,
     },
 
     InstallFullSnapshot {
@@ -112,6 +138,12 @@ where C: RaftTypeConfig
             }
             RaftMsg::RequestVote { rpc, .. } => {
                 format!("RequestVote: {}", rpc.summary())
+            }
+            RaftMsg::RequestPreVote { rpc, .. } => {
+                format!("RequestPreVote: {}", rpc.summary())
+            }
+            RaftMsg::TimeoutNow { rpc, .. } => {
+                format!("TimeoutNow: {}", rpc.summary())
             }
             RaftMsg::BeginReceivingSnapshot { .. } => "BeginReceivingSnapshot".to_string(),
             RaftMsg::InstallFullSnapshot { vote, snapshot, .. } => {

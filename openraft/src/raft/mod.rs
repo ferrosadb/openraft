@@ -424,6 +424,44 @@ where C: RaftTypeConfig
         self.inner.call_core(RaftMsg::RequestVote { rpc, tx }, rx).await
     }
 
+    /// Submit a PreVoteRequest RPC to this Raft node (ferrosa fork — ADR-012, Ongaro Sec 9.6).
+    ///
+    /// PreVote is a non-mutating probe used by a node that suspects the leader is dead but has not
+    /// yet committed to incrementing its term. Receivers reject if they have heard from the current
+    /// leader within `election_timeout` (lease-aware rejection) or if the candidate's log is stale.
+    ///
+    /// Crucially, handling a PreVoteRequest does NOT mutate any persistent vote/term state —
+    /// rejected pre-votes do not advance the candidate's term, breaking the runaway-term cascade
+    /// documented in `bug-raft-stale-candidate-runaway-term-no-prevote.md`.
+    #[tracing::instrument(level = "debug", skip(self, rpc))]
+    pub async fn pre_vote(
+        &self,
+        rpc: PreVoteRequest<C::NodeId>,
+    ) -> Result<PreVoteResponse<C::NodeId>, RaftError<C::NodeId>> {
+        tracing::info!(rpc = display(rpc.summary()), "Raft::pre_vote()");
+
+        let (tx, rx) = C::AsyncRuntime::oneshot();
+        self.inner.call_core(RaftMsg::RequestPreVote { rpc, tx }, rx).await
+    }
+
+    /// Submit a TimeoutNowRequest RPC to this Raft node (ferrosa fork — ADR-012, Ongaro Sec 3.10).
+    ///
+    /// `TimeoutNow` is sent by a leader transferring leadership to instruct a specific follower to
+    /// immediately start an election (skipping both the election timer and the PreVote phase).
+    ///
+    /// On receipt with `req.vote.term >= self.current_term` and a sufficiently up-to-date log,
+    /// the receiver advances its term, transitions to Candidate, and starts a regular election.
+    #[tracing::instrument(level = "debug", skip(self, rpc))]
+    pub async fn timeout_now(
+        &self,
+        rpc: TimeoutNowRequest<C::NodeId>,
+    ) -> Result<TimeoutNowResponse<C::NodeId>, RaftError<C::NodeId>> {
+        tracing::info!(rpc = display(rpc.summary()), "Raft::timeout_now()");
+
+        let (tx, rx) = C::AsyncRuntime::oneshot();
+        self.inner.call_core(RaftMsg::TimeoutNow { rpc, tx }, rx).await
+    }
+
     /// Get the latest snapshot from the state machine.
     ///
     /// It returns error only when `RaftCore` fails to serve the request, e.g., Encountering a

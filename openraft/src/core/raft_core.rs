@@ -1162,6 +1162,30 @@ where
 
                 self.handle_vote_request(rpc, tx);
             }
+            RaftMsg::RequestPreVote { rpc, tx } => {
+                tracing::info!(
+                    pre_vote_request = display(&rpc),
+                    "received RaftMsg::RequestPreVote (ADR-012): {}",
+                    func_name!()
+                );
+                let resp = self.engine.handle_pre_vote_req(rpc);
+                self.engine.output.push_command(Command::Respond {
+                    when: None,
+                    resp: Respond::new(Ok::<_, Infallible>(resp), tx),
+                });
+            }
+            RaftMsg::TimeoutNow { rpc, tx } => {
+                tracing::info!(
+                    timeout_now_request = display(&rpc),
+                    "received RaftMsg::TimeoutNow (ADR-012): {}",
+                    func_name!()
+                );
+                let resp = self.engine.handle_timeout_now_req(rpc);
+                self.engine.output.push_command(Command::Respond {
+                    when: None,
+                    resp: Respond::new(Ok::<_, Infallible>(resp), tx),
+                });
+            }
             RaftMsg::BeginReceivingSnapshot { tx } => {
                 self.engine.handle_begin_receiving_snapshot(tx);
             }

@@ -10,7 +10,9 @@ use crate::progress::entry::ProgressEntry;
 use crate::progress::Inflight;
 use crate::raft::AppendEntriesResponse;
 use crate::raft::InstallSnapshotResponse;
+use crate::raft::PreVoteResponse;
 use crate::raft::SnapshotResponse;
+use crate::raft::TimeoutNowResponse;
 use crate::raft::VoteRequest;
 use crate::raft::VoteResponse;
 use crate::type_config::alias::OneshotSenderOf;
@@ -231,6 +233,8 @@ pub(crate) enum Respond<C>
 where C: RaftTypeConfig
 {
     Vote(ValueSender<C, Result<VoteResponse<C::NodeId>, Infallible>>),
+    PreVote(ValueSender<C, Result<PreVoteResponse<C::NodeId>, Infallible>>),
+    TimeoutNow(ValueSender<C, Result<TimeoutNowResponse<C::NodeId>, Infallible>>),
     AppendEntries(ValueSender<C, Result<AppendEntriesResponse<C::NodeId>, Infallible>>),
     ReceiveSnapshotChunk(ValueSender<C, Result<(), InstallSnapshotError>>),
     InstallSnapshot(ValueSender<C, Result<InstallSnapshotResponse<C::NodeId>, InstallSnapshotError>>),
@@ -252,6 +256,8 @@ where C: RaftTypeConfig
     pub(crate) fn send(self) {
         match self {
             Respond::Vote(x) => x.send(),
+            Respond::PreVote(x) => x.send(),
+            Respond::TimeoutNow(x) => x.send(),
             Respond::AppendEntries(x) => x.send(),
             Respond::ReceiveSnapshotChunk(x) => x.send(),
             Respond::InstallSnapshot(x) => x.send(),
