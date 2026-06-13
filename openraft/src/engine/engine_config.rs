@@ -25,6 +25,14 @@ pub(crate) struct EngineConfig<NID: NodeId> {
     /// The maximum number of entries per payload allowed to be transmitted during replication
     pub(crate) max_payload_entries: u64,
 
+    /// Whether the pre-vote round (Raft §9.6 / Ongaro pre-vote, W3.3 / ADR-012) is enabled.
+    ///
+    /// When `true`, an election-timeout drives the node into
+    /// [`PreCandidate`](crate::core::ServerState::PreCandidate): it probes peers with a
+    /// prospective, non-committed vote and only advances its term once a quorum pre-grants.
+    /// When `false`, the node elects directly as in stock openraft.
+    pub(crate) enable_pre_vote: bool,
+
     pub(crate) timer_config: time_state::Config,
 }
 
@@ -36,6 +44,7 @@ impl<NID: NodeId> Default for EngineConfig<NID> {
             max_in_snapshot_log_to_keep: 1000,
             purge_batch_size: 256,
             max_payload_entries: 300,
+            enable_pre_vote: false,
             timer_config: time_state::Config::default(),
         }
     }
@@ -50,6 +59,7 @@ impl<NID: NodeId> EngineConfig<NID> {
             max_in_snapshot_log_to_keep: config.max_in_snapshot_log_to_keep,
             purge_batch_size: config.purge_batch_size,
             max_payload_entries: config.max_payload_entries,
+            enable_pre_vote: config.enable_pre_vote,
             timer_config: time_state::Config {
                 election_timeout,
                 smaller_log_timeout: Duration::from_millis(config.election_timeout_max * 2),

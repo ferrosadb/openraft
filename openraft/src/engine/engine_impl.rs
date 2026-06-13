@@ -34,6 +34,8 @@ use crate::proposer::leader_state::CandidateState;
 use crate::proposer::Candidate;
 use crate::proposer::LeaderQuorumSet;
 use crate::proposer::LeaderState;
+use crate::proposer::PreCandidate;
+use crate::proposer::PreVoteResult;
 use crate::raft::responder::Responder;
 use crate::raft::AppendEntriesResponse;
 use crate::raft::SnapshotResponse;
@@ -90,6 +92,18 @@ where C: RaftTypeConfig
     /// without losing leadership status.
     pub(crate) candidate: CandidateState<C>,
 
+    /// Represents the PreCandidate (pre-vote probing) state (W3.3, ADR-012).
+    ///
+    /// When pre-vote is enabled, an election timeout drives the node into this state instead of
+    /// directly to [`Candidate`](crate::core::ServerState::Candidate). It probes peers with a
+    /// prospective, non-committed vote and only promotes to a real candidate (advancing its term)
+    /// once a quorum of voters pre-grant.
+    //
+    // `dead_code`: read by `Engine::pre_elect`/`handle_pre_vote_resp` (W3.3), which RaftCore does
+    // not yet call (deferred W3.1-RPC dispatch per sprint-03-openraft-patches). Fully unit-tested.
+    #[allow(dead_code)]
+    pub(crate) pre_candidate: Option<PreCandidate<C, LeaderQuorumSet<C::NodeId>>>,
+
     /// Tracks explicit invalidation of this node's leader lease (W3.7).
     ///
     /// Set when this node steps down as leader so its own still-recent committed vote no longer
@@ -113,6 +127,7 @@ where C: RaftTypeConfig
             seen_greater_log: false,
             leader: None,
             candidate: None,
+            pre_candidate: None,
             leader_lease: LeaderLease::default(),
             output: EngineOutput::new(4096),
         }
@@ -240,6 +255,124 @@ where C: RaftTypeConfig
             vote_req: VoteRequest::new(new_vote, last_log_id),
         });
 
+        self.server_state_handler().update_server_state_if_changed();
+    }
+
+    /// Begin an election, running a pre-vote round first if it is enabled (W3.3, ADR-012).
+    ///
+    /// This is the entry point an election-timeout should call instead of [`elect`](Self::elect)
+    /// directly. The state machine is:
+    ///
+    /// - pre-vote disabled → fall straight through to [`elect`](Self::elect) (stock behavior).
+    /// - pre-vote enabled → enter [`PreCandidate`](ServerState::PreCandidate) with a *prospective*
+    ///   vote for `term + 1` held only in memory (no `SaveVote`, no term advance), broadcast a
+    ///   [`Command::SendPreVote`] probe, and record this node's own implicit pre-grant. A
+    ///   single-voter cluster reaches quorum immediately and promotes to a real candidate here.
+    //
+    // `dead_code`: this is the W3.3 election state machine entry point. RaftCore's election-timeout
+    // path still calls `elect` directly; switching it to `pre_elect` is the deferred wiring (it also
+    // requires the W3.1-RPC pre-vote network dispatch). Fully unit-tested in `pre_elect_test`.
+    #[allow(dead_code)]
+    #[tracing::instrument(level = "debug", skip(self))]
+    pub(crate) fn pre_elect(&mut self) {
+        if !self.config.enable_pre_vote {
+            self.elect();
+            return;
+        }
+
+        let prospective_term = self.state.vote.leader_id().term + 1;
+        // Prospective, non-committed vote. Never persisted while in PreCandidate.
+        let prospective_vote = Vote::new(prospective_term, self.config.id.clone());
+
+        let membership = self.state.membership_state.effective().membership();
+        let quorum_set = membership.to_quorum_set();
+
+        let mut pre_candidate = PreCandidate::<C, _>::new(prospective_vote.clone(), quorum_set);
+
+        let last_log_id = self.state.last_log_id().cloned();
+
+        tracing::info!(
+            prospective_vote = display(&prospective_vote),
+            "{}: enter PreCandidate",
+            func_name!()
+        );
+
+        // A single-voter cluster's own implicit pre-grant is already a quorum: promote at once.
+        let self_grant = pre_candidate.record_pre_grant(self.config.id.clone());
+        if self_grant == PreVoteResult::Promote {
+            self.promote_to_candidate();
+            return;
+        }
+
+        self.pre_candidate = Some(pre_candidate);
+        self.state.server_state = ServerState::PreCandidate;
+
+        self.output.push_command(Command::SendPreVote {
+            vote_req: VoteRequest::new(prospective_vote, last_log_id),
+        });
+    }
+
+    /// Handle a pre-vote response from `target` while in
+    /// [`PreCandidate`](ServerState::PreCandidate) (W3.3, ADR-012).
+    ///
+    /// Drives the pre-vote decision state machine:
+    /// - quorum pre-grant → [`promote_to_candidate`](Self::promote_to_candidate) (real election,
+    ///   term bumped there).
+    /// - strictly-higher-term rejection, or a rejecting quorum →
+    ///   [`revert_to_follower`](Self::revert_to_follower) **without** advancing the term (W3.4).
+    /// - otherwise keep probing.
+    ///
+    /// A response that does not match the prospective vote (a delayed reply to a prior round) is
+    /// ignored. If this node is no longer a pre-candidate, the response is ignored.
+    //
+    // `dead_code`: driven by the deferred W3.1-RPC `PreVoteResponse` dispatch in RaftCore. Fully
+    // unit-tested in `pre_elect_test`.
+    #[allow(dead_code)]
+    #[tracing::instrument(level = "debug", skip(self, resp))]
+    pub(crate) fn handle_pre_vote_resp(&mut self, target: C::NodeId, resp: VoteResponse<C::NodeId>) {
+        let Some(pre_candidate) = self.pre_candidate.as_mut() else {
+            tracing::debug!("ignore pre-vote response: not a pre-candidate");
+            return;
+        };
+
+        // Ignore a delayed response to a previous pre-vote round.
+        if resp.vote_granted && &resp.vote != pre_candidate.prospective_vote_ref() {
+            tracing::debug!("ignore pre-vote grant: prospective vote changed (stale response)");
+            return;
+        }
+
+        let result = if resp.vote_granted {
+            pre_candidate.record_pre_grant(target)
+        } else {
+            let voter_term = resp.vote.leader_id().get_term();
+            pre_candidate.record_pre_reject(target, voter_term)
+        };
+
+        match result {
+            PreVoteResult::Continue => {}
+            PreVoteResult::Promote => self.promote_to_candidate(),
+            PreVoteResult::RevertToFollower => self.revert_to_follower(),
+        }
+    }
+
+    /// Promote from [`PreCandidate`](ServerState::PreCandidate) to a real
+    /// [`Candidate`](ServerState::Candidate): clear the pre-candidate state and run the real
+    /// election (which is the only point at which the term is incremented and the vote persisted).
+    #[allow(dead_code)]
+    fn promote_to_candidate(&mut self) {
+        self.pre_candidate = None;
+        self.elect();
+    }
+
+    /// Revert from [`PreCandidate`](ServerState::PreCandidate) back to
+    /// [`Follower`](ServerState::Follower) without advancing the term (the W3.4 runaway-term fix).
+    ///
+    /// The prospective vote is discarded; persistent state is untouched.
+    #[allow(dead_code)]
+    fn revert_to_follower(&mut self) {
+        self.pre_candidate = None;
+        // Recompute from unchanged persistent state: with no candidate/leader, a voter is a
+        // Follower (a non-voter would be a Learner).
         self.server_state_handler().update_server_state_if_changed();
     }
 

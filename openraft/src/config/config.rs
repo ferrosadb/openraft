@@ -239,6 +239,24 @@ pub struct Config {
            default_missing_value = "true"
     )]
     pub enable_elect: bool,
+
+    /// Whether to run a pre-vote round before a real election (Raft §9.6 / Ongaro pre-vote,
+    /// W3.3 / ADR-012).
+    ///
+    /// When enabled, a node that times out the leader enters
+    /// [`PreCandidate`](crate::core::ServerState::PreCandidate) and probes peers with a
+    /// prospective, non-committed vote, advancing its term only after a quorum pre-grants. This
+    /// prevents a partitioned node with a stale log from repeatedly incrementing its term (the
+    /// runaway-term election storm). Defaults to `false` to preserve stock openraft behavior.
+    // clap 4 requires `num_args = 0..=1`, or it complains about missing arg error
+    // https://github.com/clap-rs/clap/discussions/4374
+    #[clap(long,
+           default_value_t = false,
+           action = clap::ArgAction::Set,
+           num_args = 0..=1,
+           default_missing_value = "true"
+    )]
+    pub enable_pre_vote: bool,
 }
 
 /// Updatable config for a raft runtime.

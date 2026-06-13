@@ -1668,6 +1668,20 @@ where
             Command::SendVote { vote_req } => {
                 self.spawn_parallel_vote_requests(&vote_req).await;
             }
+            Command::SendPreVote { vote_req } => {
+                // W3.3 emits this when pre-vote is enabled. The RaftCore async network dispatch for
+                // pre-vote probes (sending PreVoteRequest RPCs and routing PreVoteResponse back to
+                // `Engine::handle_pre_vote_resp`) is the deferred W3.1-RPC wiring per
+                // sprint-03-openraft-patches. Until that lands, `Config::enable_pre_vote` MUST stay
+                // false; emitting this command without the dispatch would silently drop the probe
+                // and stall every election. Fail loud rather than fake success.
+                unreachable!(
+                    "SendPreVote reached the runtime, but the pre-vote network dispatch is not yet \
+                     wired (W3.1-RPC deferred). Do not set Config::enable_pre_vote=true until it is. \
+                     vote_req={}",
+                    vote_req.summary()
+                );
+            }
             Command::ReplicateCommitted { committed } => {
                 for node in self.replications.values() {
                     let _ = node.tx_repl.send(Replicate::Committed(committed.clone()));
