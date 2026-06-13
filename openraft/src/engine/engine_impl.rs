@@ -6,7 +6,6 @@ use crate::core::raft_msg::AppendEntriesTx;
 use crate::core::raft_msg::ResultSender;
 use crate::core::sm;
 use crate::core::ServerState;
-use crate::display_ext::DisplayInstantExt;
 use crate::display_ext::DisplayOptionExt;
 use crate::display_ext::DisplaySlice;
 use crate::engine::engine_config::EngineConfig;
@@ -269,43 +268,96 @@ where C: RaftTypeConfig
         None
     }
 
-    #[tracing::instrument(level = "debug", skip_all)]
-    pub(crate) fn handle_vote_req(&mut self, req: VoteRequest<C::NodeId>) -> VoteResponse<C::NodeId> {
+    /// W3.7/W3.2 leader-lease predicate.
+    ///
+    /// Returns `true` iff this node currently believes a leader's lease is still valid, i.e. it has
+    /// a *committed* vote (it acknowledged a leader) and less than `leader_lease` has elapsed since
+    /// that vote was last modified. While the lease is valid the node must not grant a (pre-)vote
+    /// to another candidate — doing so would risk disrupting a live leader.
+    ///
+    /// This is a pure read of `state`/`config` with no side effects, shared by `handle_vote_req`
+    /// (W3.2) and `handle_pre_vote_req` (W3.1).
+    pub(crate) fn leader_lease_is_valid(&self) -> bool {
         let now = C::now();
         let lease = self.config.timer_config.leader_lease;
-        let vote = self.state.vote_ref();
+
+        if !self.state.vote_ref().is_committed() {
+            return false;
+        }
 
         // Make default vote-last-modified a low enough value, that expires leader lease.
         let vote_utime = self.state.vote_last_modified().unwrap_or_else(|| now - lease - Duration::from_millis(1));
 
+        now <= vote_utime + lease
+    }
+
+    /// W3.1 engine-side pre-vote handler.
+    ///
+    /// A pre-vote is a *read-only probe* (Raft §9.6 / Ongaro pre-vote): the responder reports
+    /// whether it *would* grant a real vote, **without mutating any persistent state** — it does
+    /// not update its vote, does not advance its term, and emits no commands. A higher
+    /// prospective term in `req.vote` is therefore deliberately ignored for persistence (the
+    /// responder side of the W3.4 runaway-term fix).
+    ///
+    /// The pre-vote is granted iff BOTH hold:
+    /// 1. the candidate's log is at least as up-to-date as ours (`req.last_log_id >=
+    ///    my_last_log_id`) — the same up-to-date test `handle_vote_req` applies; and
+    /// 2. no leader lease is currently valid
+    ///    ([`leader_lease_is_valid`](Self::leader_lease_is_valid) is `false`).
+    ///
+    /// The response always carries this node's *current, unchanged* vote and last log id so the
+    /// pre-candidate can detect a stale probe.
+    //
+    // `dead_code`: this is the W3.1 engine decision handler and is fully unit-tested in
+    // `engine::tests::handle_pre_vote_req_test`. The remaining wiring — the `RaftCore` async event
+    // dispatch that calls this on an inbound `PreVoteRequest` RPC — is deferred to a later work item
+    // per the sprint-03-openraft-patches plan, alongside the deferred `PreCandidate` driver. This is
+    // NOT a stub returning fabricated success: it computes the real grant decision from live state.
+    #[allow(dead_code)]
+    #[tracing::instrument(level = "debug", skip_all)]
+    pub(crate) fn handle_pre_vote_req(&self, req: VoteRequest<C::NodeId>) -> VoteResponse<C::NodeId> {
+        tracing::info!(
+            req = display(req.summary()),
+            my_vote = display(self.state.vote_ref().summary()),
+            my_last_log_id = display(self.state.last_log_id().summary()),
+            "Engine::handle_pre_vote_req"
+        );
+
+        let my_vote = self.state.vote_ref();
+        let my_last_log_id = self.state.last_log_id().cloned();
+
+        // (2) A valid leader lease forbids granting: do not disrupt a live leader.
+        if self.leader_lease_is_valid() {
+            tracing::info!("reject pre-vote: leader lease is still valid");
+            return VoteResponse::new(my_vote, my_last_log_id, false);
+        }
+
+        // (1) The candidate's log must be at least as up-to-date as ours.
+        let log_ok = req.last_log_id.as_ref() >= self.state.last_log_id();
+        if !log_ok {
+            tracing::info!(
+                "reject pre-vote: by last_log_id: !(req.last_log_id({}) >= my_last_log_id({}))",
+                req.last_log_id.summary(),
+                self.state.last_log_id().summary(),
+            );
+        }
+
+        // Pure probe: no `update_vote`, no term advance, no commands.
+        VoteResponse::new(my_vote, my_last_log_id, log_ok)
+    }
+
+    #[tracing::instrument(level = "debug", skip_all)]
+    pub(crate) fn handle_vote_req(&mut self, req: VoteRequest<C::NodeId>) -> VoteResponse<C::NodeId> {
         tracing::info!(req = display(req.summary()), "Engine::handle_vote_req");
         tracing::info!(
             my_vote = display(self.state.vote_ref().summary()),
             my_last_log_id = display(self.state.last_log_id().summary()),
             "Engine::handle_vote_req"
         );
-        tracing::info!(
-            "now; {}, vote is updated at: {}, vote is updated before {:?}, leader lease({:?}) will expire after {:?}",
-            now.display(),
-            vote_utime.display(),
-            now - vote_utime,
-            lease,
-            vote_utime + lease - now
-        );
 
-        if vote.is_committed() {
-            // Current leader lease has not yet expired, reject voting request
-            if now <= vote_utime + lease {
-                tracing::info!(
-                    "reject vote-request: leader lease has not yet expire; now; {:?}, vote is updatd at: {:?}, leader lease({:?}) will expire after {:?}",
-                    now,
-                    vote_utime,
-                    lease,
-                    vote_utime + lease - now
-                );
-
-                return VoteResponse::new(self.state.vote_ref(), self.state.last_log_id().cloned(), false);
-            }
+        if self.leader_lease_is_valid() {
+            tracing::info!("reject vote-request: leader lease has not yet expired");
+            return VoteResponse::new(self.state.vote_ref(), self.state.last_log_id().cloned(), false);
         }
 
         // The first step is to check log. If the candidate has less log, nothing needs to be done.
