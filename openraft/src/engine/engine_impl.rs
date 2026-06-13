@@ -18,6 +18,7 @@ use crate::engine::handler::replication_handler::SendNone;
 use crate::engine::handler::server_state_handler::ServerStateHandler;
 use crate::engine::handler::snapshot_handler::SnapshotHandler;
 use crate::engine::handler::vote_handler::VoteHandler;
+use crate::engine::leader_lease::LeaderLease;
 use crate::engine::Command;
 use crate::engine::EngineOutput;
 use crate::engine::Respond;
@@ -89,6 +90,12 @@ where C: RaftTypeConfig
     /// without losing leadership status.
     pub(crate) candidate: CandidateState<C>,
 
+    /// Tracks explicit invalidation of this node's leader lease (W3.7).
+    ///
+    /// Set when this node steps down as leader so its own still-recent committed vote no longer
+    /// keeps the implicit leader lease alive and blocks pre-votes for its successor.
+    pub(crate) leader_lease: LeaderLease<<C::AsyncRuntime as AsyncRuntime>::Instant>,
+
     /// Output entry for the runtime.
     pub(crate) output: EngineOutput<C>,
 }
@@ -106,6 +113,7 @@ where C: RaftTypeConfig
             seen_greater_log: false,
             leader: None,
             candidate: None,
+            leader_lease: LeaderLease::default(),
             output: EngineOutput::new(4096),
         }
     }
@@ -287,6 +295,14 @@ where C: RaftTypeConfig
 
         // Make default vote-last-modified a low enough value, that expires leader lease.
         let vote_utime = self.state.vote_last_modified().unwrap_or_else(|| now - lease - Duration::from_millis(1));
+
+        // W3.7: a lease explicitly invalidated at or after the vote's last-modified time (e.g. by
+        // this node stepping down as leader) is dead, even though the committed-vote utime is still
+        // within the lease window. Acknowledging a *new* leader moves `vote_utime` forward past the
+        // invalidation and re-arms the lease.
+        if self.leader_lease.is_invalidated_for(vote_utime) {
+            return false;
+        }
 
         now <= vote_utime + lease
     }
@@ -582,6 +598,11 @@ where C: RaftTypeConfig
 
         #[allow(clippy::collapsible_if)]
         if em.log_id().as_ref() <= self.state.committed() {
+            // W3.7: invalidate our own leader lease as we relinquish leadership. Without this, our
+            // still-recent committed-vote utime keeps `leader_lease_is_valid()` reporting `true`,
+            // so we would keep rejecting pre-votes for our successor and extend the leaderless gap.
+            // Acknowledging a new leader later re-arms the lease via the fresher vote utime.
+            self.leader_lease.invalidate(C::now());
             self.vote_handler().update_internal_server_state();
         }
     }
