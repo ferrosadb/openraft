@@ -8,6 +8,15 @@ pub enum ServerState {
     Learner,
     /// The node is replicating logs from the leader.
     Follower,
+    /// The node timed out the leader and is probing peers with `PreVoteRequest`,
+    /// without incrementing its term (W3.3, ADR-012).
+    ///
+    /// A node enters this state instead of [`Candidate`](Self::Candidate) when pre-vote is
+    /// enabled. It only advances to [`Candidate`](Self::Candidate) (and bumps its term) after a
+    /// quorum of peers pre-grant the prospective vote. On rejection it reverts to
+    /// [`Follower`](Self::Follower) without ever advancing its term, preventing the runaway-term
+    /// election storm a stale node would otherwise cause.
+    PreCandidate,
     /// The node is campaigning to become the cluster leader.
     Candidate,
     /// The node is the Raft cluster leader.
@@ -25,6 +34,11 @@ impl ServerState {
     /// Check if currently in follower state.
     pub fn is_follower(&self) -> bool {
         matches!(self, Self::Follower)
+    }
+
+    /// Check if currently in pre-candidate state (probing peers with pre-vote).
+    pub fn is_pre_candidate(&self) -> bool {
+        matches!(self, Self::PreCandidate)
     }
 
     /// Check if currently in candidate state.
