@@ -766,6 +766,14 @@ where
             "about to apply"
         );
 
+        // A short read must not reach the index below. `entries.len() - 1` on an
+        // empty vec underflows to usize::MAX and panics inside the raft
+        // runtime, which kills consensus while leaving the process alive and
+        // still answering reads -- see log_read_shortfall.
+        if let Some(reason) = log_read_shortfall(since, end, entries.len()) {
+            return Err(StorageIOError::read_logs(AnyError::error(reason)).into());
+        }
+
         let last_applied = entries[entries.len() - 1].get_log_id().clone();
 
         let cmd = sm::Command::apply(entries).with_seq(seq);
@@ -2017,5 +2025,84 @@ where
         }
 
         Ok(None)
+    }
+}
+
+/// Did the log store return every entry that was asked for?
+///
+/// `apply_to_state_machine` reads `since..end` and then takes
+/// `entries[entries.len() - 1]`. It guards `since == end` beforehand, so the
+/// range is non-empty and the author reasonably expected at least one entry.
+/// A store that returns fewer underflows that subtraction:
+///
+///     index out of bounds: the len is 0 but the index is 18446744073709551615
+///
+/// which is `0usize - 1`. Observed on a ferrosa node whose raft thread died on
+/// it, leaving the process alive and serving reads with no cluster schema -- a
+/// node answering queries while its consensus was dead.
+///
+/// A short read is a real storage condition: log truncation, compaction racing
+/// a read, or a hole left by an interrupted write. It must surface as a storage
+/// error naming the range, so the failure says which entries are missing
+/// instead of dying inside an index expression.
+///
+/// Returns `None` when the read is complete, or a description of the shortfall.
+pub(crate) fn log_read_shortfall(since: u64, end: u64, returned: usize) -> Option<String> {
+    let wanted = end.saturating_sub(since);
+    let returned = returned as u64;
+    if returned >= wanted {
+        return None;
+    }
+    Some(format!(
+        "log store returned {returned} entries for range {since}..{end}, expected {wanted}; \
+the log has a hole at or after index {}",
+        since + returned
+    ))
+}
+
+#[cfg(test)]
+mod log_read_shortfall_tests {
+    use super::log_read_shortfall;
+
+    /// The case that killed a node: a non-empty range answered with nothing.
+    #[test]
+    fn an_empty_read_for_a_non_empty_range_is_a_shortfall() {
+        let reason = log_read_shortfall(7, 9, 0).expect("0 entries for 7..9 is short");
+        assert!(reason.contains("7..9"), "the reason must name the range: {reason}");
+        assert!(reason.contains("expected 2"), "{reason}");
+        assert!(
+            reason.contains("hole at or after index 7"),
+            "and where the log stops: {reason}"
+        );
+    }
+
+    /// A partial read is the same defect one entry later, and the old code would
+    /// NOT have panicked on it -- it would have applied the wrong last_applied
+    /// and carried on, which is worse than a crash.
+    #[test]
+    fn a_partial_read_is_a_shortfall_too() {
+        let reason = log_read_shortfall(0, 5, 3).expect("3 entries for 0..5 is short");
+        assert!(reason.contains("hole at or after index 3"), "{reason}");
+    }
+
+    #[test]
+    fn a_complete_read_is_not_a_shortfall() {
+        assert_eq!(log_read_shortfall(0, 5, 5), None);
+        assert_eq!(log_read_shortfall(7, 9, 2), None);
+    }
+
+    /// More than asked for cannot underflow the index. Refusing it here would
+    /// turn a harmless over-read into an outage.
+    #[test]
+    fn an_over_read_is_not_a_shortfall() {
+        assert_eq!(log_read_shortfall(0, 2, 5), None);
+    }
+
+    /// An empty range never reaches this code -- apply_to_state_machine returns
+    /// early on since == end -- but the helper must not invent a shortfall if it
+    /// ever does: 0 entries for 3..3 is a complete read.
+    #[test]
+    fn an_empty_range_is_complete_by_definition() {
+        assert_eq!(log_read_shortfall(3, 3, 0), None);
     }
 }
