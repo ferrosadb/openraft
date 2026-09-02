@@ -766,10 +766,15 @@ where
             "about to apply"
         );
 
-        // A short read must not reach the index below. `entries.len() - 1` on an
-        // empty vec underflows to usize::MAX and panics inside the raft
+        // An unusable read must not reach the index below. `entries.len() - 1`
+        // on an empty vec underflows to usize::MAX and panics inside the raft
         // runtime, which kills consensus while leaving the process alive and
         // still answering reads -- see log_read_shortfall.
+        //
+        // The `since == end` guard above and the `debug_assert!` are not enough:
+        // the assert is compiled out of release builds, and an INVERTED range
+        // (since > end) passes `check_range_matches_entries` as though it were
+        // empty.
         if let Some(reason) = log_read_shortfall(since, end, entries.len()) {
             return Err(StorageIOError::read_logs(AnyError::error(reason)).into());
         }
@@ -2028,12 +2033,10 @@ where
     }
 }
 
-/// Did the log store return every entry that was asked for?
+/// Can the result of reading `since..end` be safely indexed?
 ///
 /// `apply_to_state_machine` reads `since..end` and then takes
-/// `entries[entries.len() - 1]`. It guards `since == end` beforehand, so the
-/// range is non-empty and the author reasonably expected at least one entry.
-/// A store that returns fewer underflows that subtraction:
+/// `entries[entries.len() - 1]`. On an empty vec that subtraction underflows:
 ///
 ///     index out of bounds: the len is 0 but the index is 18446744073709551615
 ///
@@ -2041,14 +2044,39 @@ where
 /// it, leaving the process alive and serving reads with no cluster schema -- a
 /// node answering queries while its consensus was dead.
 ///
-/// A short read is a real storage condition: log truncation, compaction racing
-/// a read, or a hole left by an interrupted write. It must surface as a storage
-/// error naming the range, so the failure says which entries are missing
-/// instead of dying inside an index expression.
+/// Two distinct conditions are checked here, and only one of them is reachable
+/// in practice:
 ///
-/// Returns `None` when the read is complete, or a description of the shortfall.
+/// 1. **An inverted range (`since > end`)** -- last_applied has run ahead of
+///    committed. This is the condition that actually panicked. The caller's
+///    `since == end` early return does not cover it, its `debug_assert!` is
+///    compiled out of release builds, and `check_range_matches_entries` sees
+///    `want_first > want_last`, classifies the range as empty and returns Ok --
+///    so an empty vec reaches the index with nothing objecting.
+///
+/// 2. **A short read (`returned < end - since`)** -- log truncation, compaction
+///    racing a read, or a hole from an interrupted write. In the current code
+///    this is ALREADY rejected by `check_range_matches_entries` before it gets
+///    here, so this arm is defence in depth rather than the live bug. It is kept
+///    because it costs nothing and the defensive check is not guaranteed to
+///    stay in that path.
+///
+/// See the tests in `log_read_shortfall_tests`, which pin both behaviours.
+///
+/// Returns `None` when the read can be indexed, or a description of the fault.
 pub(crate) fn log_read_shortfall(since: u64, end: u64, returned: usize) -> Option<String> {
-    let wanted = end.saturating_sub(since);
+    // An inverted range first: `since > end` means last_applied has run ahead of
+    // committed. `check_range_matches_entries` classifies an inverted range as an
+    // empty one and returns Ok, so nothing below this point would notice, and
+    // `end - since` would itself underflow. This is the path that panicked.
+    if since > end {
+        return Some(format!(
+            "log apply range {since}..{end} is inverted (since > end); \
+last_applied has run ahead of committed and no entries can satisfy this range"
+        ));
+    }
+
+    let wanted = end - since;
     let returned = returned as u64;
     if returned >= wanted {
         return None;
@@ -2063,6 +2091,45 @@ the log has a hole at or after index {}",
 #[cfg(test)]
 mod log_read_shortfall_tests {
     use super::log_read_shortfall;
+    use crate::defensive::check_range_matches_entries;
+    use crate::engine::testing::UTConfig;
+
+    /// Why an empty vec can reach `entries[entries.len() - 1]` at all.
+    ///
+    /// `get_log_entries` runs `check_range_matches_entries` after the store read,
+    /// and for a NORMAL short read that check rejects the result -- so a plain
+    /// short read never reaches the index. An INVERTED range is different: the
+    /// check computes want_first=9, want_last=6, sees want_first > want_last,
+    /// classifies it as an empty range and returns Ok. The empty vec then flows
+    /// through to the index expression.
+    ///
+    /// This test pins that behaviour. If `check_range_matches_entries` is ever
+    /// changed to reject inverted ranges, this test fails loudly rather than
+    /// leaving the guard above as silently dead code.
+    #[test]
+    fn check_range_matches_entries_lets_an_inverted_range_through() {
+        let entries: Vec<<UTConfig as crate::RaftTypeConfig>::Entry> = vec![];
+
+        assert!(
+            check_range_matches_entries::<UTConfig, _>(9..7, &entries).is_ok(),
+            "an inverted range is classified as empty and passes the defensive check"
+        );
+
+        // ... and this is the underflow it hands to the caller.
+        assert_eq!(entries.len().wrapping_sub(1), usize::MAX);
+    }
+
+    /// The contrast that proves the inverted range is the ONLY surviving path:
+    /// a genuine short read is refused by the defensive check first.
+    #[test]
+    fn check_range_matches_entries_rejects_a_genuine_short_read() {
+        let entries: Vec<<UTConfig as crate::RaftTypeConfig>::Entry> = vec![];
+
+        assert!(
+            check_range_matches_entries::<UTConfig, _>(7..9, &entries).is_err(),
+            "0 entries for 7..9 must be rejected before the index is ever reached"
+        );
+    }
 
     /// The case that killed a node: a non-empty range answered with nothing.
     #[test]
@@ -2104,5 +2171,34 @@ mod log_read_shortfall_tests {
     #[test]
     fn an_empty_range_is_complete_by_definition() {
         assert_eq!(log_read_shortfall(3, 3, 0), None);
+    }
+
+    /// RED (2026-09-02). The condition that ACTUALLY produced the observed panic.
+    ///
+    /// `apply_to_state_machine` guards `since == end` but not `since > end`, and
+    /// its `debug_assert!(since <= end)` is compiled out of release builds --
+    /// which is what ferrosa ships. When last_applied runs ahead of committed,
+    /// the range is INVERTED, and `check_range_matches_entries` treats an
+    /// inverted range as an empty one and returns Ok, so an empty vec reaches
+    /// `entries[entries.len() - 1]` and underflows.
+    ///
+    /// A genuine short read cannot reach that index at all -- the defensive
+    /// check rejects it first -- so the inverted range is the only surviving
+    /// path to this panic, and it is the one the guard must cover.
+    #[test]
+    fn an_inverted_range_is_a_shortfall() {
+        let reason = log_read_shortfall(9, 7, 0).expect("since=9 > end=7 must be refused, not indexed");
+        assert!(reason.contains("9"), "the reason must name since: {reason}");
+        assert!(reason.contains("7"), "and end: {reason}");
+    }
+
+    /// The inversion is a bug whether or not the store happened to return rows;
+    /// indexing is not the only hazard, applying the wrong range is worse.
+    #[test]
+    fn an_inverted_range_is_a_shortfall_even_with_entries() {
+        assert!(
+            log_read_shortfall(9, 7, 3).is_some(),
+            "since > end is incoherent regardless of what the store returned"
+        );
     }
 }
