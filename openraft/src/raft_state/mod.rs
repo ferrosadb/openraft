@@ -33,6 +33,7 @@ mod tests {
     mod forward_to_leader_test;
     mod is_initialized_test;
     mod log_state_reader_test;
+    mod update_committed_test;
     mod validate_test;
 }
 
@@ -270,9 +271,41 @@ where
 
     /// Update field `committed` if the input is greater.
     /// If updated, it returns the previous value in a `Some()`.
+    ///
+    /// The committed **index** never regresses, even when the incoming log id
+    /// ranks greater overall. [`LogId`]'s `Ord` is lexicographic on
+    /// `(leader_id, index)` with `leader_id` first, so a higher-term log id at
+    /// a *lower* index compares greater. Accepting one moves committed
+    /// backwards in index, and `Command::Commit` derives its apply window from
+    /// the pair:
+    ///
+    /// ```text
+    /// apply_to_state_machine(seq, already_committed.next_index(), upto.index)
+    /// ```
+    ///
+    /// so the window comes out inverted (`since > end`). `defensive.rs`
+    /// classifies an inverted range as *empty* rather than invalid, so the
+    /// empty `Vec` reaches `entries[entries.len() - 1]` and `0usize - 1` wraps
+    /// to `usize::MAX`, panicking the consensus runtime. A node that restarts
+    /// into this state cannot make progress and never recovers.
     #[tracing::instrument(level = "debug", skip_all)]
     pub(crate) fn update_committed(&mut self, committed: &Option<LogId<NID>>) -> Option<Option<LogId<NID>>> {
         if committed.as_ref() > self.committed() {
+            if let (Some(new), Some(current)) = (committed.as_ref(), self.committed()) {
+                if new.index < current.index {
+                    tracing::warn!(
+                        new_index = new.index,
+                        new_term = display(&new.leader_id),
+                        current_index = current.index,
+                        current_term = display(&current.leader_id),
+                        "refusing a committed index regression: the incoming log id ranks \
+                         higher by term but sits at a lower index, which would invert the \
+                         apply window"
+                    );
+                    return None;
+                }
+            }
+
             let prev = self.committed().cloned();
 
             self.committed = committed.clone();
