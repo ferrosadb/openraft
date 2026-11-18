@@ -18,7 +18,8 @@ repository    = { workspace = true }
 anyerror        = { workspace = true }
 anyhow          = { workspace = true, optional = true }
 byte-unit       = { workspace = true }
-chrono          = { workspace = true }
+# Displays `Instant`s as wall-clock time in the local (system) time zone.
+jiff            = { workspace = true, features = ["std", "tz-system", "tzdb-bundle-platform", "tzdb-zoneinfo", "tzdb-concatenated"] }
 clap            = { workspace = true }
 derive_more     = { workspace = true }
 futures         = { workspace = true }

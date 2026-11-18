@@ -157,15 +157,15 @@ impl Since {
 
         let date_str = Self::parse_str(date_lit, "date", span)?;
 
-        chrono::NaiveDate::parse_from_str(&date_str, "%Y-%m-%d").map_err(|_e| {
-            syn::Error::new(
+        if !is_valid_ymd_date(&date_str) {
+            return Err(syn::Error::new(
                 span,
                 format!(
                     "`date`(`{}`) is not valid date string. Expected format: yyyy-mm-dd",
                     date_str
                 ),
-            )
-        })?;
+            ));
+        }
 
         self.date = Some(date_str);
 
@@ -194,5 +194,137 @@ impl Since {
             }
         };
         Ok(s)
+    }
+}
+
+/// Smallest year accepted by chrono 0.4's `NaiveDate`.
+const MIN_YEAR: i64 = -262_143;
+/// Largest year accepted by chrono 0.4's `NaiveDate`.
+const MAX_YEAR: i64 = 262_142;
+
+/// Returns whether `s` is a valid `%Y-%m-%d` date.
+///
+/// Accepts exactly what `chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")`
+/// (chrono 0.4) accepted, which this macro used before:
+/// - whitespace is skipped before each number;
+/// - the year is 1 to 4 digits, or any number of digits after an explicit `+` or `-` sign;
+/// - month and day are 1 or 2 digits;
+/// - no trailing input;
+/// - the date exists in the proleptic Gregorian calendar, with the year in chrono's range.
+fn is_valid_ymd_date(s: &str) -> bool {
+    let Some((year, month, day)) = parse_ymd(s) else {
+        return false;
+    };
+    if !(MIN_YEAR..=MAX_YEAR).contains(&year) {
+        return false;
+    }
+    let (Ok(month), Ok(day)) = (i8::try_from(month), i8::try_from(day)) else {
+        return false;
+    };
+    // The Gregorian calendar repeats every 400 years, so validating the same
+    // month and day in an equivalent year inside jiff's range (-9999..=9999)
+    // is exact for every year in chrono's range.
+    let equivalent_year = 2000 + year.rem_euclid(400);
+    let equivalent_year = i16::try_from(equivalent_year).expect("2000..2400 fits in i16");
+    jiff::civil::Date::new(equivalent_year, month, day).is_ok()
+}
+
+/// Splits `s` into `(year, month, day)` following chrono's `%Y-%m-%d` parser.
+fn parse_ymd(s: &str) -> Option<(i64, i64, i64)> {
+    let (year, s) = parse_year(s.trim_start())?;
+    let s = s.strip_prefix('-')?;
+    let (month, s) = parse_digits(s.trim_start(), 2)?;
+    let s = s.strip_prefix('-')?;
+    let (day, s) = parse_digits(s.trim_start(), 2)?;
+    if !s.is_empty() {
+        return None;
+    }
+    Some((year, month, day))
+}
+
+/// Parses chrono's `%Y`: an explicit sign allows any number of digits,
+/// otherwise at most 4 digits are consumed.
+fn parse_year(s: &str) -> Option<(i64, &str)> {
+    if let Some(rest) = s.strip_prefix('-') {
+        let (v, rest) = parse_digits(rest, usize::MAX)?;
+        Some((v.checked_neg()?, rest))
+    } else if let Some(rest) = s.strip_prefix('+') {
+        parse_digits(rest, usize::MAX)
+    } else {
+        parse_digits(s, 4)
+    }
+}
+
+/// Consumes 1 to `max` leading ASCII digits; `None` if there are none or on overflow.
+fn parse_digits(s: &str, max: usize) -> Option<(i64, &str)> {
+    let len = s.bytes().take(max).take_while(u8::is_ascii_digit).count();
+    if len == 0 {
+        return None;
+    }
+    let mut v: i64 = 0;
+    for b in s[..len].bytes() {
+        v = v.checked_mul(10)?.checked_add(i64::from(b - b'0'))?;
+    }
+    Some((v, &s[len..]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_valid_ymd_date;
+
+    #[test]
+    fn test_valid_dates() {
+        for s in [
+            "2021-01-01",
+            "2024-02-29",
+            "2000-02-29",
+            "1999-12-31",
+            "0000-01-01",
+            "1-1-1",
+            "21-1-01",
+            " 2021-01-01",
+            "2021- 1- 1",
+            "2021-\t01-01",
+            "+2021-01-01",
+            "+0002021-01-01",
+            "-2021-01-01",
+            "+262142-12-31",
+            "-262143-01-01",
+            "-0004-02-29",
+        ] {
+            assert!(is_valid_ymd_date(s), "expected valid: {:?}", s);
+        }
+    }
+
+    #[test]
+    fn test_invalid_dates() {
+        for s in [
+            "2021-01--",
+            "",
+            "2021",
+            "2021-01",
+            "2021-01-",
+            "2021-13-01",
+            "2021-00-01",
+            "2021-01-00",
+            "2021-01-32",
+            "2023-02-29",
+            "1900-02-29",
+            "2021-04-31",
+            "20210-01-01",
+            "2021-001-01",
+            "2021-01-001",
+            "2021 -01-01",
+            "2021-01-01 ",
+            "2021/01/01",
+            "+262143-01-01",
+            "-262144-12-31",
+            "+99999999999999999999-01-01",
+            "- 2021-01-01",
+            "2021-+1-01",
+            "yyyy-mm-dd",
+        ] {
+            assert!(!is_valid_ymd_date(s), "expected invalid: {:?}", s);
+        }
     }
 }
